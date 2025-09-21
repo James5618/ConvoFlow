@@ -1,0 +1,342 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: encrypted-chat
+  labels:
+    name: encrypted-chat
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: encrypted-chat
+data:
+  NODE_ENV: "production"
+  PORT: "3001"
+  CORS_ORIGIN: "https://encrypted-chat.example.com"
+  LOG_LEVEL: "info"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: app-secrets
+  namespace: encrypted-chat
+type: Opaque
+stringData:
+  JWT_SECRET: "your-jwt-secret-here"
+  DATABASE_URL: "postgres://user:pass@postgres:5432/chatapp"
+  REDIS_URL: "redis://:password@redis:6379"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: encrypted-chat-backend
+  namespace: encrypted-chat
+  labels:
+    app: encrypted-chat-backend
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: encrypted-chat-backend
+  template:
+    metadata:
+      labels:
+        app: encrypted-chat-backend
+    spec:
+      containers:
+      - name: backend
+        image: ghcr.io/your-org/encrypted-chat-backend:${IMAGE_TAG}
+        ports:
+        - containerPort: 3001
+          name: http
+        env:
+        - name: NODE_ENV
+          valueFrom:
+            configMapKeyRef:
+              name: app-config
+              key: NODE_ENV
+        - name: PORT
+          valueFrom:
+            configMapKeyRef:
+              name: app-config
+              key: PORT
+        - name: CORS_ORIGIN
+          valueFrom:
+            configMapKeyRef:
+              name: app-config
+              key: CORS_ORIGIN
+        - name: LOG_LEVEL
+          valueFrom:
+            configMapKeyRef:
+              name: app-config
+              key: LOG_LEVEL
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: JWT_SECRET
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: DATABASE_URL
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: REDIS_URL
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 3001
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 3001
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1001
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        - name: logs
+          mountPath: /app/logs
+      volumes:
+      - name: tmp
+        emptyDir: {}
+      - name: logs
+        emptyDir: {}
+      securityContext:
+        fsGroup: 1001
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: encrypted-chat-frontend
+  namespace: encrypted-chat
+  labels:
+    app: encrypted-chat-frontend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: encrypted-chat-frontend
+  template:
+    metadata:
+      labels:
+        app: encrypted-chat-frontend
+    spec:
+      containers:
+      - name: frontend
+        image: ghcr.io/your-org/encrypted-chat-frontend:${IMAGE_TAG}
+        ports:
+        - containerPort: 80
+          name: http
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 80
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 101
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: cache
+          mountPath: /var/cache/nginx
+        - name: run
+          mountPath: /var/run
+      volumes:
+      - name: cache
+        emptyDir: {}
+      - name: run
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: encrypted-chat-backend-service
+  namespace: encrypted-chat
+  labels:
+    app: encrypted-chat-backend
+spec:
+  type: ClusterIP
+  ports:
+  - port: 3001
+    targetPort: 3001
+    protocol: TCP
+    name: http
+  selector:
+    app: encrypted-chat-backend
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: encrypted-chat-frontend-service
+  namespace: encrypted-chat
+  labels:
+    app: encrypted-chat-frontend
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: 80
+    protocol: TCP
+    name: http
+  selector:
+    app: encrypted-chat-frontend
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: encrypted-chat-ingress
+  namespace: encrypted-chat
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+spec:
+  tls:
+  - hosts:
+    - encrypted-chat.example.com
+    secretName: encrypted-chat-tls
+  rules:
+  - host: encrypted-chat.example.com
+    http:
+      paths:
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: encrypted-chat-backend-service
+            port:
+              number: 3001
+      - path: /socket.io
+        pathType: Prefix
+        backend:
+          service:
+            name: encrypted-chat-backend-service
+            port:
+              number: 3001
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: encrypted-chat-frontend-service
+            port:
+              number: 80
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: encrypted-chat-backend-pdb
+  namespace: encrypted-chat
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: encrypted-chat-backend
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: encrypted-chat-frontend-pdb
+  namespace: encrypted-chat
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: encrypted-chat-frontend
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: encrypted-chat-backend-hpa
+  namespace: encrypted-chat
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: encrypted-chat-backend
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: encrypted-chat-frontend-hpa
+  namespace: encrypted-chat
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: encrypted-chat-frontend
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70

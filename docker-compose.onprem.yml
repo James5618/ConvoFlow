@@ -1,0 +1,570 @@
+# On-Premise Production Docker Compose with Persistent Storage
+version: '3.8'
+
+services:
+  # PostgreSQL Database with persistent storage
+  postgres:
+    image: postgres:15-alpine
+    container_name: encrypted-chat-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-chatapp}
+      POSTGRES_USER: ${POSTGRES_USER:-chatuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-chatpass}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - postgres_backups:/backups
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+      - ./scripts/postgres-backup.sh:/usr/local/bin/backup.sh:ro
+    networks:
+      - convoflow-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-chatuser} -d ${POSTGRES_DB:-chatapp}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+      - /var/run/postgresql
+
+  # Redis with persistence enabled
+  redis:
+    image: redis:7-alpine
+    container_name: encrypted-chat-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-redispass}
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+      - redis_config:/usr/local/etc/redis
+      - ./scripts/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    networks:
+      - convoflow-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    security_opt:
+      - no-new-privileges:true
+
+  # Backend API server
+  backend:
+    image: ${REGISTRY_URL:-ghcr.io/your-org}/encrypted-chat-backend:${IMAGE_TAG:-latest}
+    container_name: encrypted-chat-backend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: 3001
+      JWT_SECRET: ${JWT_SECRET}
+      DATABASE_URL: postgres://${POSTGRES_USER:-chatuser}:${POSTGRES_PASSWORD:-chatpass}@postgres:5432/${POSTGRES_DB:-chatapp}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redispass}@redis:6379
+      CORS_ORIGIN: ${CORS_ORIGIN:-https://localhost}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "3001:3001"
+    volumes:
+      - app_logs:/app/logs
+      - app_uploads:/app/uploads
+      - app_temp:/tmp
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - convoflow-network
+    healthcheck:
+      test: ["CMD", "node", "server/healthcheck.js"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      replicas: ${BACKEND_REPLICAS:-2}
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+    security_opt:
+      - no-new-privileges:true
+    user: "1001:1001"
+
+  # Frontend React app with Nginx
+  frontend:
+    image: ${REGISTRY_URL:-ghcr.io/your-org}/encrypted-chat-frontend:${IMAGE_TAG:-latest}
+    container_name: encrypted-chat-frontend
+    restart: unless-stopped
+    environment:
+      REACT_APP_API_URL: ${REACT_APP_API_URL:-https://localhost/api}
+      REACT_APP_SOCKET_URL: ${REACT_APP_SOCKET_URL:-https://localhost}
+    volumes:
+      - nginx_cache:/var/cache/nginx
+      - nginx_logs:/var/log/nginx
+      - static_files:/usr/share/nginx/html
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - backend
+    networks:
+      - convoflow-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      replicas: ${FRONTEND_REPLICAS:-2}
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+    security_opt:
+      - no-new-privileges:true
+
+  # Nginx Load Balancer and SSL Termination
+  nginx-lb:
+    image: nginx:alpine
+    container_name: encrypted-chat-nginx-lb
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx-lb.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - nginx_lb_logs:/var/log/nginx
+      - nginx_cache:/var/cache/nginx
+    depends_on:
+      - frontend
+      - backend
+    networks:
+      - convoflow-network
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+    security_opt:
+      - no-new-privileges:true
+
+  # Prometheus monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: encrypted-chat-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - prometheus_data:/prometheus
+      - prometheus_config:/etc/prometheus
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/rules:/etc/prometheus/rules:ro
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--storage.tsdb.retention.size=10GB'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+      - '--web.enable-admin-api'
+    networks:
+      - convoflow-network
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 2G
+        reservations:
+          cpus: '0.25'
+          memory: 512M
+    security_opt:
+      - no-new-privileges:true
+
+  # Grafana dashboards
+  grafana:
+    image: grafana/grafana:latest
+    container_name: encrypted-chat-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - grafana_logs:/var/log/grafana
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SECURITY_DISABLE_GRAVATAR=true
+      - GF_ANALYTICS_REPORTING_ENABLED=false
+      - GF_ANALYTICS_CHECK_FOR_UPDATES=false
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel
+    networks:
+      - convoflow-network
+    depends_on:
+      - prometheus
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    security_opt:
+      - no-new-privileges:true
+
+  # Loki for log aggregation
+  loki:
+    image: grafana/loki:latest
+    container_name: encrypted-chat-loki
+    restart: unless-stopped
+    ports:
+      - "3100:3100"
+    volumes:
+      - loki_data:/loki
+      - loki_config:/etc/loki
+      - ./monitoring/loki-config.yml:/etc/loki/local-config.yaml:ro
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - convoflow-network
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    security_opt:
+      - no-new-privileges:true
+
+  # Promtail for log collection
+  promtail:
+    image: grafana/promtail:latest
+    container_name: encrypted-chat-promtail
+    restart: unless-stopped
+    volumes:
+      - promtail_config:/etc/promtail
+      - ./monitoring/promtail-config.yml:/etc/promtail/config.yml:ro
+      - app_logs:/var/log/app:ro
+      - nginx_logs:/var/log/nginx:ro
+      - nginx_lb_logs:/var/log/nginx-lb:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: -config.file=/etc/promtail/config.yml
+    networks:
+      - convoflow-network
+    depends_on:
+      - loki
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.1'
+          memory: 128M
+    security_opt:
+      - no-new-privileges:true
+
+  # Database backup service
+  postgres-backup:
+    image: postgres:15-alpine
+    container_name: encrypted-chat-postgres-backup
+    restart: unless-stopped
+    environment:
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: ${POSTGRES_DB:-chatapp}
+      PGUSER: ${POSTGRES_USER:-chatuser}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-chatpass}
+      BACKUP_SCHEDULE: "0 2 * * *"  # Daily at 2 AM
+      BACKUP_RETENTION_DAYS: 30
+    volumes:
+      - postgres_backups:/backups
+      - ./scripts/postgres-backup.sh:/usr/local/bin/backup.sh:ro
+      - ./scripts/postgres-restore.sh:/usr/local/bin/restore.sh:ro
+    command: /bin/sh -c "while true; do sleep 86400; /usr/local/bin/backup.sh; done"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - convoflow-network
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.1'
+          memory: 64M
+    security_opt:
+      - no-new-privileges:true
+
+  # Redis backup service
+  redis-backup:
+    image: redis:7-alpine
+    container_name: encrypted-chat-redis-backup
+    restart: unless-stopped
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-redispass}
+      BACKUP_SCHEDULE: "0 3 * * *"  # Daily at 3 AM
+    volumes:
+      - redis_backups:/backups
+      - ./scripts/redis-backup.sh:/usr/local/bin/backup.sh:ro
+    command: /bin/sh -c "while true; do sleep 86400; /usr/local/bin/backup.sh; done"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - convoflow-network
+    deploy:
+      resources:
+        limits:
+          cpus: '0.25'
+          memory: 128M
+        reservations:
+          cpus: '0.05'
+          memory: 32M
+    security_opt:
+      - no-new-privileges:true
+
+# Persistent volumes for data storage
+volumes:
+  # Database volumes
+  postgres_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/encrypted-chat/data/postgres
+  postgres_backups:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/encrypted-chat/backups/postgres
+  
+  # Redis volumes
+  redis_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/encrypted-chat/data/redis
+  redis_config:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/encrypted-chat/config/redis
+  redis_backups:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/encrypted-chat/backups/redis
+  
+  # Application volumes
+  app_logs:
+    driver: local
+    driver_opts:
+      type: none  
+      o: bind
+      device: /opt/encrypted-chat/logs/app
+  app_uploads:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/encrypted-chat/data/uploads
+  app_temp:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/encrypted-chat/temp
+  
+  # Nginx volumes
+  nginx_cache:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/encrypted-chat/cache/nginx
+  nginx_logs:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/encrypted-chat/logs/nginx
+  nginx_lb_logs:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/encrypted-chat/logs/nginx-lb
+  static_files:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/encrypted-chat/data/static
+  
+  # Monitoring volumes
+  prometheus_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/encrypted-chat/data/prometheus
+  prometheus_config:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/encrypted-chat/config/prometheus
+  grafana_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/encrypted-chat/data/grafana
+  grafana_logs:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/encrypted-chat/logs/grafana
+  loki_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/encrypted-chat/data/loki
+  loki_config:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/encrypted-chat/config/loki
+  promtail_config:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/encrypted-chat/config/promtail
+  
+  # COTURN volumes
+  coturn_logs:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/encrypted-chat/logs/coturn
+  coturn_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/encrypted-chat/data/coturn
+
+  # COTURN TURN Server for WebRTC
+  coturn:
+    image: coturn/coturn:latest
+    container_name: encrypted-chat-coturn
+    restart: unless-stopped
+    ports:
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      - "5349:5349/tcp"
+      - "49152-65535:49152-65535/udp"
+    volumes:
+      - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+      - ./coturn/certs:/opt/coturn/certs:ro
+      - coturn_logs:/var/log/coturn
+      - coturn_data:/var/lib/coturn
+    environment:
+      - TURN_SECRET=${TURN_SECRET:-your-super-secret-turn-key-change-in-production}
+      - TURN_REALM=${TURN_REALM:-chat-app.local}
+      - TURN_EXTERNAL_IP=${TURN_EXTERNAL_IP:-127.0.0.1}
+    command: ["-c", "/etc/coturn/turnserver.conf", "-v"]
+    networks:
+      convoflow-network:
+        ipv4_address: 172.20.0.15
+    healthcheck:
+      test: ["CMD", "turnutils_uclient", "-t", "127.0.0.1", "-p", "3478"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.2'
+          memory: 256M
+    security_opt:
+      - no-new-privileges:true
+
+# Networks
+networks:
+  convoflow-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

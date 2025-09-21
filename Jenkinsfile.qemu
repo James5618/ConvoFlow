@@ -1,0 +1,240 @@
+pipeline {
+    agent any
+    
+    environment {
+        DOCKER_REGISTRY = 'your-registry.com'
+        IMAGE_NAME = 'encrypted-chat-app'
+        QEMU_SSH_KEY = credentials('qemu-ssh-key')
+        ANSIBLE_VAULT_PASSWORD = credentials('ansible-vault-password')
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_COMMIT_SHORT = sh(
+                        script: 'git rev-parse --short HEAD',
+                        returnStdout: true
+                    ).trim()
+                }
+            }
+        }
+        
+        stage('Build Application') {
+            steps {
+                script {
+                    log_info "Building application..."
+                    sh 'docker build -t ${IMAGE_NAME}:${GIT_COMMIT_SHORT} .'
+                    sh 'docker tag ${IMAGE_NAME}:${GIT_COMMIT_SHORT} ${IMAGE_NAME}:latest'
+                }
+            }
+        }
+        
+        stage('Security Scan') {
+            parallel {
+                stage('Container Scan') {
+                    steps {
+                        sh 'docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy image ${IMAGE_NAME}:${GIT_COMMIT_SHORT}'
+                    }
+                }
+                stage('Code Scan') {
+                    steps {
+                        sh 'npm audit --audit-level high'
+                    }
+                }
+            }
+        }
+        
+        stage('Test') {
+            parallel {
+                stage('Unit Tests') {
+                    steps {
+                        sh 'npm test'
+                    }
+                    post {
+                        always {
+                            publishTestResults testResultsPattern: 'test-results.xml'
+                        }
+                    }
+                }
+                stage('Integration Tests') {
+                    steps {
+                        sh 'npm run test:integration'
+                    }
+                }
+            }
+        }
+        
+        stage('QEMU Environment Check') {
+            steps {
+                script {
+                    log_info "Checking QEMU environment..."
+                    sh '''
+                        cd qemu/vms
+                        ./status.sh > vm_status.txt
+                        if grep -q "STOPPED" vm_status.txt; then
+                            echo "Some VMs are stopped. Starting all VMs..."
+                            sudo ./start-all.sh
+                            sleep 30
+                        fi
+                    '''
+                }
+            }
+        }
+        
+        stage('Deploy to QEMU Staging') {
+            when {
+                anyOf {
+                    branch 'develop'
+                    branch 'staging'
+                }
+            }
+            steps {
+                script {
+                    log_info "Deploying to QEMU staging environment..."
+                    sh '''
+                        # Copy SSH key
+                        cp ${QEMU_SSH_KEY} ~/.ssh/id_rsa
+                        chmod 600 ~/.ssh/id_rsa
+                        
+                        # Update application image in ansible vars
+                        echo "app_image: ${IMAGE_NAME}:${GIT_COMMIT_SHORT}" > ansible/group_vars/staging.yml
+                        
+                        # Deploy with Ansible
+                        cd ansible
+                        ansible-playbook -i inventory.staging.ini site.yml --vault-password-file ${ANSIBLE_VAULT_PASSWORD}
+                    '''
+                }
+            }
+            post {
+                always {
+                    script {
+                        // Run post-deployment tests
+                        sh 'cd ansible && ./test-deployment.sh staging'
+                    }
+                }
+            }
+        }
+        
+        stage('Smoke Tests on QEMU') {
+            when {
+                anyOf {
+                    branch 'develop'
+                    branch 'staging'
+                }
+            }
+            steps {
+                script {
+                    sh '''
+                        # Wait for services to be ready
+                        timeout 300 bash -c 'until curl -k -s https://192.168.100.12/health; do sleep 5; done'
+                        
+                        # Run smoke tests
+                        cd tests
+                        npm run test:smoke -- --baseUrl=https://192.168.100.12
+                    '''
+                }
+            }
+        }
+        
+        stage('Deploy to QEMU Production') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    // Require manual approval for production
+                    input message: 'Deploy to QEMU Production?', ok: 'Deploy',
+                          submitterParameter: 'APPROVER'
+                    
+                    log_info "Deploying to QEMU production environment..."
+                    sh '''
+                        # Copy SSH key
+                        cp ${QEMU_SSH_KEY} ~/.ssh/id_rsa
+                        chmod 600 ~/.ssh/id_rsa
+                        
+                        # Update application image in ansible vars
+                        echo "app_image: ${IMAGE_NAME}:${GIT_COMMIT_SHORT}" > ansible/group_vars/production.yml
+                        
+                        # Deploy with Ansible
+                        cd ansible
+                        ansible-playbook -i inventory.ini site.yml --vault-password-file ${ANSIBLE_VAULT_PASSWORD}
+                    '''
+                }
+            }
+            post {
+                success {
+                    script {
+                        // Notify success
+                        sh '''
+                            curl -X POST -H 'Content-type: application/json' \
+                            --data '{"text":"✅ QEMU Production deployment successful for commit ${GIT_COMMIT_SHORT}"}' \
+                            ${SLACK_WEBHOOK_URL}
+                        '''
+                    }
+                }
+                failure {
+                    script {
+                        // Notify failure and rollback
+                        sh '''
+                            curl -X POST -H 'Content-type: application/json' \
+                            --data '{"text":"❌ QEMU Production deployment failed for commit ${GIT_COMMIT_SHORT}"}' \
+                            ${SLACK_WEBHOOK_URL}
+                            
+                            # Trigger rollback
+                            cd ansible
+                            ansible-playbook -i inventory.ini rollback.yml --vault-password-file ${ANSIBLE_VAULT_PASSWORD}
+                        '''
+                    }
+                }
+            }
+        }
+        
+        stage('Performance Tests') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    sh '''
+                        # Run performance tests against QEMU environment
+                        cd performance-tests
+                        npm run test:load -- --baseUrl=https://192.168.100.12
+                    '''
+                }
+            }
+            post {
+                always {
+                    publishHTML([
+                        allowMissing: false,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: 'performance-tests/reports',
+                        reportFiles: 'index.html',
+                        reportName: 'Performance Test Report'
+                    ])
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            // Clean up
+            sh '''
+                docker system prune -f
+                rm -f ~/.ssh/id_rsa
+            '''
+        }
+        success {
+            script {
+                if (env.BRANCH_NAME == 'main') {
+                    // Tag successful production deployment
+                    sh "git tag -a v${BUILD_NUMBER} -m 'Production deployment ${BUILD_NUMBER}'"
+                    sh "git push origin v${BUILD_NUMBER}"
+                }
+            }
+        }
+    }
+}

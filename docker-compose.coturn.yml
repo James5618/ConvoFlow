@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  coturn:
+    image: coturn/coturn:latest
+    container_name: chat-coturn
+    restart: unless-stopped
+    ports:
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      - "5349:5349/tcp"
+      - "49152-65535:49152-65535/udp"
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+      - ./certs:/opt/coturn/certs:ro
+      - coturn-logs:/var/log/coturn
+    command: ["-c", "/etc/coturn/turnserver.conf"]
+    networks:
+      - convoflow-network
+
+  # CoTURN management web interface (optional)
+  turnserver-admin:
+    image: nginx:alpine
+    container_name: chat-turnserver-admin
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    volumes:
+      - ./admin:/usr/share/nginx/html:ro
+      - ./nginx-admin.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      - convoflow-network
+    depends_on:
+      - coturn
+
+volumes:
+  coturn-logs:
+
+networks:
+  convoflow-network:
+    external: true
