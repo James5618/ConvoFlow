@@ -62,6 +62,8 @@ CREATE TABLE IF NOT EXISTS server_members (
 -- Add server support to rooms (channels within servers)
 ALTER TABLE rooms ADD COLUMN IF NOT EXISTS server_id VARCHAR(255) REFERENCES servers(id) ON DELETE CASCADE;
 ALTER TABLE rooms ADD COLUMN IF NOT EXISTS is_channel BOOLEAN DEFAULT false;
+-- Add is_voice column for voice channels
+ALTER TABLE rooms ADD COLUMN IF NOT EXISTS is_voice BOOLEAN DEFAULT false;
 
 -- Private messages table - direct messages between users
 CREATE TABLE IF NOT EXISTS private_messages (
