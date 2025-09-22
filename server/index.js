@@ -507,6 +507,19 @@ app.post('/api/servers', authenticateToken, async (req, res) => {
       [channelId, req.user.id]
     );
     
+    // Create default voice channel for the server
+    const voiceChannelId = 'channel_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+    await pool.query(
+      'INSERT INTO rooms (id, name, created_by, server_id, is_channel, is_voice) VALUES ($1, $2, $3, $4, $5, $6)',
+      [voiceChannelId, 'General Voice', req.user.id, serverId, true, true]
+    );
+
+    // Add owner to the voice channel
+    await pool.query(
+      'INSERT INTO room_members (room_id, user_id) VALUES ($1, $2)',
+      [voiceChannelId, req.user.id]
+    );
+    
     res.json({ 
       id: serverId, 
       name, 
@@ -645,6 +658,124 @@ app.post('/api/servers/:serverId/channels', authenticateToken, async (req, res) 
     res.json({ id: channelId, name, created_by: req.user.id, server_id: serverId, is_channel: true });
   } catch (error) {
     console.error('Create channel error:', error);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Create voice channel in a server
+app.post('/api/servers/:serverId/voice-channels', authenticateToken, async (req, res) => {
+  try {
+    const { serverId } = req.params;
+    const { name } = req.body;
+
+    // Verify user is an admin or owner of the server
+    const memberResult = await pool.query(
+      'SELECT role FROM server_members WHERE server_id = $1 AND user_id = $2',
+      [serverId, req.user.id]
+    );
+    const member = memberResult.rows[0];
+    if (!member || (member.role !== 'admin' && member.role !== 'owner')) {
+      return res.status(403).json({ error: 'Insufficient permissions' });
+    }
+
+    const channelId = 'voice_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+
+    await pool.query(
+      'INSERT INTO rooms (id, name, created_by, server_id, is_channel, is_voice) VALUES ($1, $2, $3, $4, $5, $6)',
+      [channelId, name || 'Voice Channel', req.user.id, serverId, true, true]
+    );
+
+    // Add all server members to the new voice channel
+    const membersResult = await pool.query(
+      'SELECT user_id FROM server_members WHERE server_id = $1',
+      [serverId]
+    );
+
+    for (const m of membersResult.rows) {
+      await pool.query(
+        'INSERT INTO room_members (room_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+        [channelId, m.user_id]
+      );
+    }
+
+    res.json({ id: channelId, name: name || 'Voice Channel', created_by: req.user.id, server_id: serverId, is_voice: true });
+  } catch (error) {
+    console.error('Create voice channel error:', error);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Server membership management (list members)
+app.get('/api/servers/:serverId/members', authenticateToken, async (req, res) => {
+  try {
+    const { serverId } = req.params;
+    // Verify requester is a member
+    const memberCheck = await pool.query('SELECT * FROM server_members WHERE server_id = $1 AND user_id = $2', [serverId, req.user.id]);
+    if (memberCheck.rows.length === 0) return res.status(403).json({ error: 'Access denied' });
+
+    const result = await pool.query(
+      `SELECT sm.user_id, sm.role, u.username, u.display_name
+       FROM server_members sm
+       JOIN users u ON sm.user_id = u.id
+       WHERE sm.server_id = $1
+       ORDER BY u.username ASC`,
+      [serverId]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Get server members error:', error);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Update member role (owner/admin only)
+app.post('/api/servers/:serverId/members/:memberId/role', authenticateToken, async (req, res) => {
+  try {
+    const { serverId, memberId } = req.params;
+    const { role } = req.body; // expected: 'member', 'moderator', 'admin', 'owner'
+
+    // Verify requester is owner or admin
+    const requester = await pool.query('SELECT role FROM server_members WHERE server_id = $1 AND user_id = $2', [serverId, req.user.id]);
+    if (!requester.rows[0] || (requester.rows[0].role !== 'owner' && requester.rows[0].role !== 'admin')) {
+      return res.status(403).json({ error: 'Insufficient permissions' });
+    }
+
+    // Prevent non-owner changing owner role
+    if (role === 'owner' && requester.rows[0].role !== 'owner') {
+      return res.status(403).json({ error: 'Only owner can assign owner role' });
+    }
+
+    await pool.query('UPDATE server_members SET role = $1 WHERE server_id = $2 AND user_id = $3', [role, serverId, memberId]);
+    res.json({ message: 'Role updated' });
+  } catch (error) {
+    console.error('Update member role error:', error);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Join/leave voice channel signalling via REST (client can still use socket events)
+app.post('/api/rooms/:roomId/voice/join', authenticateToken, async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    // Add member to room_members if not already
+    await pool.query('INSERT INTO room_members (room_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [roomId, req.user.id]);
+    // Emit via socket.io
+    io.to(roomId).emit('voice-user-joined', { userId: req.user.id, username: req.user.username });
+    res.json({ message: 'Joined voice channel', roomId });
+  } catch (error) {
+    console.error('Voice join error:', error);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+app.post('/api/rooms/:roomId/voice/leave', authenticateToken, async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    // Optionally remove from room_members or keep membership
+    io.to(roomId).emit('voice-user-left', { userId: req.user.id, username: req.user.username });
+    res.json({ message: 'Left voice channel', roomId });
+  } catch (error) {
+    console.error('Voice leave error:', error);
     res.status(500).json({ error: 'Database error' });
   }
 });
